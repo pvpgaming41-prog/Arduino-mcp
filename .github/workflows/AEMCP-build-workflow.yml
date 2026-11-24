@@ -3,7 +3,6 @@ name: AEMCP Build and Deploy
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -12,102 +11,128 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
-
 jobs:
-  test:
+  validate:
     name: Validate source
     runs-on: ubuntu-latest
     outputs:
-      project_dir: ${{ steps.locate.outputs.project_dir }}
+      source_dir: ${{ steps.source.outputs.dir }}
     steps:
-      - name: Checkout source
+      - name: Check out repository
         uses: actions/checkout@v5
-
-      - name: Locate AEMCP project folder
-        id: locate
-        shell: bash
-        run: |
-          if [ -f package.json ]; then
-            DIR="."
-          elif [ -f arduino-engineering-mcp/package.json ]; then
-            DIR="arduino-engineering-mcp"
-          else
-            echo "Could not find package.json at repository root or in arduino-engineering-mcp/."
-            echo "Repository files:"
-            ls -la
-            exit 1
-          fi
-          echo "project_dir=$DIR" >> "$GITHUB_OUTPUT"
-          echo "Using project directory: $DIR"
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
           node-version: 24
 
+      - name: Find and extract AEMCP source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="$(find . -maxdepth 2 -type f -name 'Arduino-Engineering-MCP-Source-only*.zip' -print -quit)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Could not find Arduino-Engineering-MCP-Source-only*.zip."
+            echo "Upload the source ZIP to the repository root, then commit it."
+            echo "Repository files:"
+            ls -la
+            exit 1
+          fi
+
+          mkdir -p aemcp-source
+          unzip -q "$ZIP_FILE" -d aemcp-source
+
+          # Support ZIPs that contain either package.json at their root
+          # or one enclosing directory.
+          if [ ! -f aemcp-source/package.json ]; then
+            PACKAGE_FILE="$(find aemcp-source -mindepth 2 -maxdepth 4 -type f -name package.json -print -quit)"
+            if [ -z "$PACKAGE_FILE" ]; then
+              echo "The ZIP does not contain package.json."
+              find aemcp-source -maxdepth 4 -type f -print
+              exit 1
+            fi
+            SOURCE_DIR="$(dirname "$PACKAGE_FILE")"
+          else
+            SOURCE_DIR="aemcp-source"
+          fi
+
+          echo "dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using source directory: $SOURCE_DIR"
+          ls -la "$SOURCE_DIR"
+
       - name: Install dependencies
-        working-directory: ${{ steps.locate.outputs.project_dir }}
+        working-directory: ${{ steps.source.outputs.dir }}
         run: npm install --no-audit --no-fund
 
       - name: Check JavaScript syntax
-        working-directory: ${{ steps.locate.outputs.project_dir }}
+        working-directory: ${{ steps.source.outputs.dir }}
         run: npm run check
 
       - name: Run tests
-        working-directory: ${{ steps.locate.outputs.project_dir }}
+        working-directory: ${{ steps.source.outputs.dir }}
         run: npm test
 
-  container:
+  build-and-publish:
     name: Build and publish Docker image
-    needs: test
+    needs: validate
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Extract AEMCP source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="$(find . -maxdepth 2 -type f -name 'Arduino-Engineering-MCP-Source-only*.zip' -print -quit)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Source ZIP not found."
+            exit 1
+          fi
+          mkdir -p aemcp-source
+          unzip -q "$ZIP_FILE" -d aemcp-source
+          if [ ! -f aemcp-source/Dockerfile ]; then
+            DOCKER_FILE="$(find aemcp-source -mindepth 2 -maxdepth 4 -type f -name Dockerfile -print -quit)"
+            if [ -z "$DOCKER_FILE" ]; then
+              echo "Dockerfile not found inside source ZIP."
+              exit 1
+            fi
+            echo "context=$(dirname "$DOCKER_FILE")" >> "$GITHUB_OUTPUT"
+          else
+            echo "context=aemcp-source" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
+
+      - name: Prepare image metadata
+        id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=sha
-      - name: Locate Dockerfile
-        id: docker-context
-        shell: bash
-        run: |
-          if [ -f Dockerfile ]; then
-            echo "context=." >> "$GITHUB_OUTPUT"
-          elif [ -f arduino-engineering-mcp/Dockerfile ]; then
-            echo "context=arduino-engineering-mcp" >> "$GITHUB_OUTPUT"
-          else
-            echo "Dockerfile not found"; ls -la; exit 1
-          fi
-      - uses: docker/build-push-action@v6
+          images: ghcr.io/${{ github.repository }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
         with:
-          context: ${{ steps.docker-context.outputs.context }}
+          context: ${{ steps.source.outputs.context }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
   deploy-render:
     name: Trigger optional Render deployment
-    needs: container
-    if: github.event_name != 'pull_request' && vars.RENDER_DEPLOY_ENABLED == 'true'
+    needs: build-and-publish
+    if: github.event_name != 'pull_request' && vars.RENDER_DEPLOY_ENABLED == 'true' && secrets.RENDER_DEPLOY_HOOK_URL != ''
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Render deploy hook
         env:
           DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-        run: |
-          test -n "$DEPLOY_HOOK" || (echo "Missing RENDER_DEPLOY_HOOK_URL secret" && exit 1)
-          curl --fail --silent --show-error --request POST "$DEPLOY_HOOK"
+        run: curl --fail --silent --show-error --request POST "$DEPLOY_HOOK"

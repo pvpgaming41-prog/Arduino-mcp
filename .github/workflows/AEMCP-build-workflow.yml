@@ -129,10 +129,16 @@ jobs:
   deploy-render:
     name: Trigger optional Render deployment
     needs: build-and-publish
-    if: github.event_name != 'pull_request' && vars.RENDER_DEPLOY_ENABLED == 'true' && secrets.RENDER_DEPLOY_HOOK_URL != ''
+    if: github.event_name != 'pull_request' && vars.RENDER_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Render deploy hook
+      - name: Trigger Render deploy hook (if configured)
         env:
           DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-        run: curl --fail --silent --show-error --request POST "$DEPLOY_HOOK"
+        shell: bash
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL is not configured; skipping Render deployment."
+            exit 0
+          fi
+          curl --fail --silent --show-error --request POST "$DEPLOY_HOOK"
